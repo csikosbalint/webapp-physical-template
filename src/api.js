@@ -1,30 +1,47 @@
-/** @import { AwsProvider, VercelProvider, GithubProvider, ArtifactProvider, EnvOptions, EnvResult, InfraOptions, InfraResult } from './types.js' */
-import { createEnv, TARGETS } from './layers/env.js';
+import { Vercel } from "@vercel/sdk";
+import { createHash } from "node:crypto";
+import fs, { createReadStream } from "node:fs"
+import { Readable } from "node:stream";
 
-/**
- * Entry point of the physical template: one object, providers injected once,
- * one method per deployment layer.
- */
 export class API {
   #vercel;
-  #env;
 
-  /**
-   * @param {{ providers: { aws?: AwsProvider, vercel: VercelProvider, github?: GithubProvider, artifact?: ArtifactProvider } }} deps
-   */
+  #listProjects() {
+    return this.#vercel.projects.getProjects({})
+  }
+
   constructor({ providers }) {
     if (!providers?.vercel) throw new TypeError('new API() needs providers.vercel');
     this.#vercel = providers.vercel;
-    this.#env = createEnv({ aws: providers.aws, vercel: providers.vercel, github: providers.github });
   }
 
-  /**
-   * ENV layer: read-only account checks. Creates nothing.
-   * @param {EnvOptions} [options]
-   * @returns {Promise<EnvResult>}
-   */
-  async listEnv(options) {
-    return this.#env(options);
+  async listEnv() {
+    return (await this.#listProjects()).projects.map(({ id, name }) => ({ envId: name }));
+  }
+
+  async createApp() {
+    const file = '/Users/bcsikos/Downloads/Code/POC/webapp-physical-template/README.md'
+    const data = Readable.toWeb(createReadStream(file))
+    const { size } = fs.statSync(file)
+    const digest = createHash('sha1').update(fs.readFileSync(file)).digest('hex')
+    const resp = this.#vercel.deployments.uploadFile({
+      requestBody: data,
+      contentLength: size,
+      xVercelDigest: digest
+    });
+    // return this.#vercel.deployments.createDeployment({
+    //   requestBody: {
+    //     customEnvironmentSlugOrId: "staging",
+    //     files: [
+    //       {
+    //         file: file,
+    //         data: data
+    //       },
+    //     ],
+    //     name: "my-instant-deployment",
+    //     project: "poc",
+    //   }
+    // })
   }
 
   /**
