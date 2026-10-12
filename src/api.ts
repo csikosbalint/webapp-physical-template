@@ -50,6 +50,7 @@ export class API {
     return this.#vercel.projects.createProject({
       requestBody: {
         name,
+        rootDirectory: "webapp-logical-template/plugins/ui",
         gitRepository: {
           repo,
           type: CreateProjectProjectsType.Github

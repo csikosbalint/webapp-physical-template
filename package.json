@@ -15,7 +15,8 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node --env-file=.env --test \"test/**/*.test.ts\""
+    "test": "node --env-file=.env --test \"test/**/*.test.ts\"",
+    "test:local": "node --env-file=.env --env-file=.env.local --test \"test/**/*.test.ts\""
   },
   "dependencies": {
     "@octokit/rest": "22.0.1",
