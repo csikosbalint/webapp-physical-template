@@ -24,6 +24,7 @@
   },
   "include": [
     "src/**/*.ts",
+    "scripts/**/*.ts",
     "spike/**/*.ts",
     "test/**/*.ts"
   ],

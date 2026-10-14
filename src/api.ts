@@ -1,10 +1,7 @@
 import { Vercel } from "@vercel/sdk";
 import type { Octokit } from "@octokit/rest";
-import { createHash } from "node:crypto";
-import fs, { createReadStream } from "node:fs";
-import { Readable } from "node:stream";
 import { CreateProjectProjectsType } from "@vercel/sdk/models/createprojectcontenthint8.js";
-import { string } from "@vercel/sdk/types/primitives.js";
+import { CreateProjectEnv1Type } from "@vercel/sdk/models/createprojectenvop.js";
 
 /** Deployment intents and the Vercel environment they map to. */
 export const TARGETS = {
@@ -50,7 +47,6 @@ export class API {
     return this.#vercel.projects.createProject({
       requestBody: {
         name,
-        rootDirectory: "webapp-logical-template/plugins/ui",
         gitRepository: {
           repo,
           type: CreateProjectProjectsType.Github
@@ -70,57 +66,73 @@ export class API {
     });
   }
 
-  async #branchRepo({ versionTag, deployTag }: { versionTag: string; deployTag: string }) {
+  async #branchRepo({ commitFrom, branchName }: { commitFrom: string; branchName: string }) {
     const owner = 'csikosbalint'
     const repo = this.#memory.env.envId
 
-    // 1. Delete the deployTag branch idempotently (ignore "not found").
+    // 1. find and delete branch if exists
     try {
-      await this.#octokit.rest.git.deleteRef({
-        owner,
-        repo,
-        ref: `heads/${deployTag}`,
-      })
+      await this.#octokit.rest.git.deleteRef({ owner, repo, ref: `heads/${branchName}` })
     } catch (err: any) {
-      if (err?.status !== 422 && err?.status !== 404) throw err
+      console.warn(`branch heads/${branchName} did not exist!`)
     }
 
-    // 2. Find the commit SHA where versionTag is seen; fall back to HEAD.
+    // 2. Find the commit SHA where branchFrom is seen; fall back to HEAD.
     let sha: string | undefined
 
-    try {
-      const { data: tags } = await this.#octokit.rest.repos.listTags({
-        owner,
-        repo,
-        per_page: 100,
-      })
-      sha = tags.find((t) => t.name === versionTag)?.commit.sha
-    } catch (err: any) {
-      if (err?.status !== 404) throw err
+    if (commitFrom !== 'HEAD') {
+      try {
+        const { data: tags } = await this.#octokit.rest.repos.listTags({
+          owner,
+          repo,
+          per_page: 100,
+        })
+        sha = tags.find((t) => t.name === commitFrom)?.commit.sha
+      } catch (err: any) {
+        console.warn(`No such commit: ${commitFrom}..using HEAD`)
+      }
     }
 
     if (!sha) {
       const { data: repoData } = await this.#octokit.rest.repos.get({ owner, repo })
+      const { data: head } = await this.#octokit.rest.repos.getBranch({
+        owner,
+        repo,
+        branch: repoData.default_branch,
+      })
+      sha = head.commit.sha
+    }
+
+    // 3. Create the branch at that commit.
+    return await this.#octokit.rest.git.createRef({
+      owner,
+      repo,
+      ref: `refs/heads/${branchName}`,
+      sha,
+    })
+  }
+
+  /**
+   * Repos created from a template are populated asynchronously, so the default
+   * branch can 404 right after creation. Poll until it exists.
+   */
+  async #waitForDefaultBranch({ owner, repo }: { owner: string; repo: string }) {
+    const attempts = 30
+    const delayMs = 2000
+    for (let i = 1; ; i++) {
       try {
+        const { data: repoData } = await this.#octokit.rest.repos.get({ owner, repo })
         const { data: head } = await this.#octokit.rest.repos.getBranch({
           owner,
           repo,
           branch: repoData.default_branch,
         })
-        sha = head.commit.sha
-      } catch (err) {
-        console.error(err)
-        sha = 'HEAD'
+        return { branch: repoData.default_branch, sha: head.commit.sha }
+      } catch (err: any) {
+        if (err?.status !== 404 || i >= attempts) throw err
+        await new Promise((resolve) => setTimeout(resolve, delayMs))
       }
     }
-
-    // 3. Create the deployTag branch at that commit.
-    return await this.#octokit.rest.git.createRef({
-      owner,
-      repo,
-      ref: `refs/heads/${deployTag}`,
-      sha,
-    })
   }
 
   constructor({ providers }: { providers: Providers }) {
@@ -157,20 +169,32 @@ export class API {
         envId: name,
         intent
       }
+      this.#memory.env = env
+
+      // The project's first deployment is the production one: deploy the
+      // default branch HEAD with the production target.
+      const owner = 'csikosbalint'
+      const { branch, sha } = await this.#waitForDefaultBranch({ owner, repo: name })
+      await this.#ensureBuildEnv()
+      await this.#deploy({ name, branch, sha, target: 'production' })
     }
     this.#memory.env = env
     return env
   }
 
   async createApp({ envId, appVersion = 'HEAD' }: { envId: string, appVersion?: string }): Promise<{ appId: string }> {
+    this.#memory.env = { envId, intent: this.#memory.env?.intent ?? 'dev' }
     const rnd = Math.floor(1000 + Math.random() * 9000)
     const appId = `app-${rnd}-${envId}`
     const { data } = await this.#branchRepo({
-      versionTag: appVersion,
-      deployTag: appId
+      commitFrom: appVersion,
+      branchName: appId
     })
     await this.#ensureBuildEnv()
-    const deployment = await this.#deploy({ name: appId, sha: data.object.sha })
+    const sha = data.object.sha
+    // Branch deployment: no target => preview (env creation already made the
+    // production deployment).
+    const deployment = await this.#deploy({ name: appId, branch: appId, sha })
     this.#memory.deployment = deployment
     return { appId }
   }
@@ -184,18 +208,23 @@ export class API {
       upsert: 'true',
       requestBody: {
         key: 'NPM_TOKEN',
+        type: CreateProjectEnv1Type.Sensitive,
         value,
-        type: 'encrypted',
         target: ['production', 'preview', 'development'],
       },
     })
   }
 
-  /** Create a Vercel deployment for the env's project at a specific commit SHA. */
-  async #deploy({ name, sha }: { name: string; sha: string }) {
+  /**
+   * Create a Vercel deployment for a branch of the env's repo.
+   * `ref` is the branch (Vercel infers production vs preview from it);
+   * `sha` pins the exact commit on that branch.
+   */
+  async #deploy({ name, branch, sha, target = 'staging' }: { name: string; branch: string; sha: string; target?: string }) {
     const owner = 'csikosbalint'
     const repo = this.#memory.env.envId
     return await this.#vercel.deployments.createDeployment({
+      forceNew: "1",
       requestBody: {
         name,
         project: this.#memory.env.envId,
@@ -203,14 +232,20 @@ export class API {
           type: 'github',
           org: owner,
           repo,
-          ref: sha,
+          ref: branch,
+          sha,
+        },
+        gitMetadata: {
+          remoteUrl: `https://github.com/${owner}/${repo}`,
+          commitRef: branch,
+          commitSha: sha,
         },
         projectSettings: {
           framework: 'nextjs',
           rootDirectory: 'plugins/ui',
-          installCommand: "pnpm install --frozen-lockfile",
-          buildCommand: "pnpm build"
+          installCommand: 'npm config set //npm.pkg.github.com/:_authToken=$NPM_TOKEN && pnpm install --frozen-lockfile',
         },
+        target,
       },
     })
   }
