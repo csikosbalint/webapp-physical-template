@@ -243,7 +243,9 @@ export class API {
         projectSettings: {
           framework: 'nextjs',
           rootDirectory: 'plugins/ui',
-          installCommand: 'npm config set //npm.pkg.github.com/:_authToken=$NPM_TOKEN && pnpm install --frozen-lockfile',
+          installCommand: 'pnpm config set //npm.pkg.github.com/:_authToken=$NPM_TOKEN && pnpm install --frozen-lockfile',
+          // Core is linked via workspace:*, so it must be built before the UI.
+          buildCommand: 'pnpm --filter @csikosbalint/webapp-platform-core build && pnpm --filter ui build',
         },
         target,
       },
